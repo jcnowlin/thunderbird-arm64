@@ -1,0 +1,5 @@
+# Bash/Python build scripts must keep LF endings even when checked out on Windows,
+# otherwise MozillaBuild's bash chokes on CRLF.
+*.sh text eol=lf
+*.py text eol=lf
+*.in text eol=lf

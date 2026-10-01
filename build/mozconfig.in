@@ -1,0 +1,29 @@
+# Thunderbird for Windows ARM64 (win64-aarch64) — unofficial build.
+# Built from unmodified upstream release source; see SETUP.md and the workflow.
+# Installed to the build root by the workflow with @HOOK_PATH@ / @OBJDIR@
+# substituted for absolute paths (mozconfig requires absolute paths here).
+
+ac_add_options --enable-project=comm/mail
+ac_add_options --target=aarch64-pc-windows-msvc
+
+# Release-style: optimized, no debug, no test compilation.
+ac_add_options --disable-debug
+ac_add_options --disable-tests
+
+# Cache C++/Rust compilation on persistent disk. The build system downloads
+# the sccache binary automatically on first use (SCCACHE_DIR is exported by
+# the build scripts).
+ac_add_options --with-ccache=sccache
+
+# Work around the clang-cl optimizer hang/crash on two librnp sources
+# (comm/third_party/rnp/src/rnp/{fficli.cpp,rnpcfg.cpp}). The upstream source
+# tree itself is left completely unmodified; this hook only adjusts compiler
+# flags for the vendored RNP directory.
+# https://connect.mozilla.org/t5/ideas/thunderbird-build-for-windows-on-arm/idc-p/87228
+ac_add_options MOZ_BUILD_HOOK=@HOOK_PATH@
+
+# Rebuild from scratch automatically when configure inputs change.
+mk_add_options AUTOCLOBBER=1
+
+# Must be an absolute path, and must not be a sibling of the source directory.
+mk_add_options MOZ_OBJDIR=@OBJDIR@

@@ -1,0 +1,293 @@
+# .github/workflows/build-arm64.yml
+#
+# Unofficial Thunderbird builds for Windows 11 ARM64 (win64-aarch64).
+#
+# ARCHITECTURE NOTES — read before "simplifying":
+# * GitHub-HOSTED windows-11-arm runners expose only ~14 GB free disk
+#   (official docs); a Thunderbird build needs 40 GB+. A hosted build can NOT
+#   fit. This workflow therefore targets a SELF-HOSTED Windows ARM64 runner
+#   (e.g. a Surface Pro X). Do not change runs-on back to windows-11-arm
+#   without solving the disk problem first.
+# * Source of truth is the official release tarball from archive.mozilla.org —
+#   the exact unmodified mozilla-release/comm-release source that Mozilla's
+#   release automation builds. No VCS checkout required.
+# * The upstream tree is NEVER patched. The only build-system tweak is a
+#   MOZ_BUILD_HOOK (build/librnp-noopt-hook.py) that compiles the vendored
+#   librnp without optimization, working around a clang-cl optimizer hang.
+# * One-time runner setup: see SETUP.md in this repo.
+
+name: Thunderbird Windows ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Thunderbird version to build, e.g. 157.0.1 (or "latest")'
+        required: false
+        default: 'latest'
+      force:
+        description: 'Rebuild even if the v<version>-arm64 release already exists'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Daily 07:00 UTC (02:00 CDT) — picks up new releases / chemspills.
+    - cron: '0 7 * * *'
+
+permissions:
+  contents: write # required to create GitHub Releases
+
+concurrency:
+  group: thunderbird-arm64
+  cancel-in-progress: false
+
+# Fixed build root on the runner. Kept constant (not parameterized) because
+# mozconfig paths and the bash scripts reference it literally.
+env:
+  TB_BUILD_ROOT: C:\tb-build
+
+jobs:
+  # ---- resolve the version + decide whether a build is needed (cheap, fast)
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve Thunderbird version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INPUT_VERSION}" ] || [ "${INPUT_VERSION}" = "latest" ]; then
+            VERSION="$(curl -fsSL https://product-details.mozilla.org/1.0/thunderbird_versions.json \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["LATEST_THUNDERBIRD_VERSION"])')"
+          else
+            VERSION="${INPUT_VERSION#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Thunderbird version: ${VERSION}"
+          if [ "${INPUT_FORCE}" = "true" ]; then
+            echo "should_build=true (forced)" >> "$GITHUB_OUTPUT"
+          elif gh release view "v${VERSION}-arm64" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release v${VERSION}-arm64 already exists; nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---- the actual build, on the self-hosted Windows ARM64 runner
+  build:
+    name: Build Thunderbird ${{ needs.resolve.outputs.version }} (win64-aarch64)
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: [self-hosted, windows, arm64]
+    # The 6-hour cap applies to GitHub-hosted runners; self-hosted jobs may
+    # raise the timeout. A cold Thunderbird build on 4 vCPU takes hours.
+    timeout-minutes: 1440
+    env:
+      TB_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out build repo (workflow, mozconfig template, hook)
+        uses: actions/checkout@v4
+
+      - name: Prepare build directories
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:TB_BUILD_ROOT" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:TB_BUILD_ROOT\_dl" | Out-Null
+          $disk = Get-PSDrive C
+          Write-Host ("C: free: {0:N1} GB" -f ($disk.Free / 1GB))
+          if (($disk.Free / 1GB) -lt 60) {
+            throw 'Less than 60 GB free on C:. Thunderbird needs 40 GB+ for the build plus headroom (see SETUP.md).'
+          }
+
+      - name: Fetch official release source tarball
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:TB_VERSION
+          $marker = "$env:TB_BUILD_ROOT\.source-version"
+          $current = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '' }
+          if ($current -eq $version -and (Test-Path "$env:TB_BUILD_ROOT\source\mach")) {
+            Write-Host "Source for $version already extracted; reusing (incremental build)."
+            exit 0
+          }
+          $base = "https://archive.mozilla.org/pub/thunderbird/releases/$version"
+          $dl = "$env:TB_BUILD_ROOT\_dl\thunderbird-$version.source.tar.xz"
+          Write-Host "Downloading $base/source/thunderbird-$version.source.tar.xz"
+          curl.exe -fSL --retry 3 --retry-delay 5 `
+            -o $dl "$base/source/thunderbird-$version.source.tar.xz"
+          Write-Host 'Verifying SHA512 against Mozilla-published checksums'
+          curl.exe -fSL --retry 3 -o "$env:TB_BUILD_ROOT\_dl\SHA512SUMS" "$base/SHA512SUMS"
+          $line = Select-String -Path "$env:TB_BUILD_ROOT\_dl\SHA512SUMS" `
+            -Pattern ([regex]::Escape("thunderbird-$version.source.tar.xz")) |
+            Select-Object -First 1 -ExpandProperty Line
+          if (!$line) { throw 'tarball entry not found in SHA512SUMS' }
+          $expected = $line.Split()[0].ToLower()
+          $actual = (Get-FileHash $dl -Algorithm SHA512).Hash.ToLower()
+          if ($expected -ne $actual) { throw 'SHA512 MISMATCH on source tarball — aborting' }
+          Write-Host 'Checksum OK.'
+          $tmp = "$env:TB_BUILD_ROOT\_src_tmp"
+          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          tar -xf $dl -C $tmp
+          $kids = @(Get-ChildItem -Directory $tmp)
+          if ($kids.Count -ne 1) { throw "unexpected tarball layout: $($kids.Count) top-level dirs" }
+          if (Test-Path "$env:TB_BUILD_ROOT\source") { Remove-Item -Recurse -Force "$env:TB_BUILD_ROOT\source" }
+          Move-Item $kids[0].FullName "$env:TB_BUILD_ROOT\source"
+          Remove-Item -Recurse -Force $tmp
+          # keep only the newest tarball to save disk
+          Get-ChildItem "$env:TB_BUILD_ROOT\_dl\thunderbird-*.source.tar.xz" |
+            Where-Object { $_.Name -ne "thunderbird-$version.source.tar.xz" } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          Set-Content -NoNewline $marker $version
+          Write-Host "Source ready at $env:TB_BUILD_ROOT\source"
+
+      - name: Install mozconfig + librnp build hook
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item "$env:GITHUB_WORKSPACE\build\librnp-noopt-hook.py" `
+            "$env:TB_BUILD_ROOT\librnp-noopt-hook.py" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\build\build.sh" `
+            "$env:TB_BUILD_ROOT\build.sh" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\build\package.sh" `
+            "$env:TB_BUILD_ROOT\package.sh" -Force
+          $hookPath = ($env:TB_BUILD_ROOT -replace '\\','/') + '/librnp-noopt-hook.py'
+          $objDir = ($env:TB_BUILD_ROOT -replace '\\','/') + '/obj-aarch64'
+          (Get-Content "$env:GITHUB_WORKSPACE\build\mozconfig.in" -Raw) `
+            -replace '@HOOK_PATH@', $hookPath `
+            -replace '@OBJDIR@', $objDir |
+            Set-Content "$env:TB_BUILD_ROOT\mozconfig" -NoNewline
+          Write-Host '--- mozconfig ---'
+          Get-Content "$env:TB_BUILD_ROOT\mozconfig"
+
+      - name: Verify toolchain
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (!(Test-Path 'C:\mozilla-build\msys2\usr\bin\bash.exe')) {
+            throw 'MozillaBuild not found at C:\mozilla-build (see SETUP.md)'
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) { throw 'vswhere.exe not found; is Visual Studio installed?' }
+          $vs = & $vswhere -latest `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            -property installationVersion
+          if (!$vs) { throw 'No Visual Studio with ARM64 C++ tools found (see SETUP.md)' }
+          Write-Host "Visual Studio (ARM64 C++ tools): $vs"
+          if ($vs.StartsWith('18.')) {
+            Write-Host '::warning::VS 2026 detected. Thunderbird configure support for VS 2026 is UNVERIFIED; the proven toolchain is VS 2022 (17.x).'
+          }
+          foreach ($cmd in 'rustc','cargo','node','gh') {
+            if (!(Get-Command $cmd -ErrorAction SilentlyContinue)) { throw "$cmd not found on PATH (see SETUP.md)" }
+            Write-Host ("{0}: {1}" -f $cmd, ((& $cmd --version | Select-Object -First 1)))
+          }
+
+      - name: Ensure Rust ARM64 target
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location "$env:TB_BUILD_ROOT\source"
+          # On ARM64 Windows this is already the host target; harmless no-op.
+          # Run from the source dir so it applies to the tree-pinned toolchain.
+          rustup target add aarch64-pc-windows-msvc
+          Pop-Location
+
+      - name: Build Thunderbird
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Runs inside MozillaBuild's MSYS2 bash (see SETUP.md). If this
+          # invocation ever stops working, the fallback is:
+          #   $env:USE_MINTTY=0; & C:\mozilla-build\start-shell.bat -c "/c/tb-build/build.sh"
+          & C:\mozilla-build\msys2\usr\bin\bash.exe --login /c/tb-build/build.sh
+
+      - name: Package installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & C:\mozilla-build\msys2\usr\bin\bash.exe --login /c/tb-build/package.sh
+
+      - name: Verify ARM64 binary + locate installer
+        id: installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Real smoke test: the built thunderbird.exe must be ARM64 (0xAA64).
+          $exe = "$env:TB_BUILD_ROOT\obj-aarch64\dist\bin\thunderbird.exe"
+          if (!(Test-Path $exe)) { throw "thunderbird.exe not found at $exe" }
+          $fs = [IO.File]::OpenRead($exe)
+          try {
+            $br = New-Object IO.BinaryReader($fs)
+            $fs.Seek(0x3C, [IO.SeekOrigin]::Begin) | Out-Null
+            $peOffset = $br.ReadInt32()
+            $fs.Seek($peOffset + 4, [IO.SeekOrigin]::Begin) | Out-Null
+            $machine = $br.ReadUInt16()
+          } finally { $fs.Close() }
+          if ($machine -ne 0xAA64) { throw ("thunderbird.exe is NOT ARM64 (machine=0x{0:X4})" -f $machine) }
+          Write-Host 'thunderbird.exe machine type is 0xAA64 (ARM64). OK.'
+          $found = @(Get-ChildItem -Path "$env:TB_BUILD_ROOT\obj-aarch64" `
+            -Filter *.installer.exe -Recurse -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) { throw "expected exactly 1 installer, found $($found.Count)" }
+          $installer = $found[0].FullName
+          Write-Host "Installer: $installer"
+          $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          "$sha  $($found[0].Name)" | Set-Content "$installer.sha256"
+          Write-Host "SHA256: $sha"
+          "path=$installer" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "name=$($found[0].Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderbird-${{ needs.resolve.outputs.version }}-win64-aarch64
+          path: ${{ steps.installer.outputs.path }}
+
+      - name: Create GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:TB_VERSION
+          $tag = "v$version-arm64"
+          $name = "${{ steps.installer.outputs.name }}"
+          $sha = "${{ steps.installer.outputs.sha256 }}"
+          $notes = @"
+          ## Thunderbird $version for Windows ARM64 — unofficial build
+
+          Native ARM64 build for Windows 11 on ARM (Surface Pro X, Snapdragon X, ...).
+          Built from the **unmodified** upstream release source:
+          https://archive.mozilla.org/pub/thunderbird/releases/$version/source/thunderbird-$version.source.tar.xz
+          (SHA512 verified against Mozilla's published checksums before building.)
+
+          Build notes: native win64-aarch64 opt build (`--target=aarch64-pc-windows-msvc`),
+          tests disabled, sccache-accelerated rebuilds. The only build-system tweak is a
+          documented moz.build hook that compiles the vendored librnp without
+          optimization (works around a clang-cl optimizer hang); the upstream source
+          tree itself was not modified.
+
+          ### Caveats
+          - **Unsigned.** Windows SmartScreen will warn on first run. Verify the SHA256 below.
+          - **Thunderbird Daily branding.** Mozilla reserves release branding for its own builds.
+          - **No automatic updates.** Reinstall from a newer release on this page when one appears.
+          - Back up your Thunderbird profile before switching builds.
+
+          ### SHA256
+          ```
+          $sha  $name
+          ```
+          "@
+          Set-Content -NoNewline release-notes.md $notes
+          gh release create $tag `
+            --title "Thunderbird $version (Windows ARM64, unofficial)" `
+            --notes-file release-notes.md `
+            "${{ steps.installer.outputs.path }}"
